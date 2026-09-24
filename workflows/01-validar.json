@@ -1,0 +1,240 @@
+{
+  "name": "01 - Validar Contatos",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "trigger",
+      "name": "Executar Manualmente",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -200,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT user_id::text AS user_id, nome, grupo, empresa, cidade, estado, pais, telefone, email, categoria, especialidade, especialidade_detalhada FROM members",
+        "options": {}
+      },
+      "id": "ler_contatos",
+      "name": "Ler Contatos",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        0,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      },
+      "notes": "Tabela real se chama 'members' (não 'contatos') no banco bni_connect — mesma estrutura da spec. user_id é bigint lá; convertido para text para bater com contatos_validacao.contato_user_id."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const dns = require('dns').promises;\n\nconst rows = items.map(i => i.json);\n\nfunction resolveMxComTimeout(domain, timeoutMs = 4000) {\n  return Promise.race([\n    dns.resolveMx(domain).then((r) => Array.isArray(r) && r.length > 0),\n    new Promise((resolve) => setTimeout(() => resolve(false), timeoutMs)),\n  ]).catch(() => false);\n}\n\nfunction normalizeEmail(raw) {\n  if (!raw) return null;\n  let e = String(raw).trim().toLowerCase();\n  const m = e.match(/^([^@\\s]+)@([^@\\s]+)$/);\n  if (!m) return null;\n  let [, local, domain] = m;\n  local = local.replace(/\\+.*$/, '');\n  if (!local || !domain || !domain.includes('.')) return null;\n  if (!/^[a-z0-9._%-]+$/.test(local)) return null;\n  if (!/^[a-z0-9.-]+$/.test(domain)) return null;\n  return `${local}@${domain}`;\n}\n\nfunction normalizePhone(raw) {\n  if (!raw) return null;\n  let digits = String(raw).replace(/\\D/g, '');\n  digits = digits.replace(/^0+/, '');\n  if (!digits.startsWith('55')) {\n    digits = '55' + digits;\n  }\n  const national = digits.slice(2);\n  // celular BR: DDD (2 dig) + 9 + 8 digitos = 11 digitos nacionais\n  if (national.length !== 11) return null;\n  if (national[2] !== '9') return null;\n  return `+${digits}`;\n}\n\nfunction completeness(row) {\n  return ['nome', 'grupo', 'empresa', 'cidade', 'estado', 'pais', 'telefone', 'email',\n          'categoria', 'especialidade', 'especialidade_detalhada']\n    .reduce((n, k) => n + (row[k] ? 1 : 0), 0);\n}\n\nconst stats = {\n  total_contatos: rows.length,\n  email_sintaxe_invalida: 0,\n  email_sem_mx: 0,\n  email_duplicado: 0,\n  email_apto: 0,\n  telefone_formato_invalido: 0,\n  telefone_duplicado: 0,\n  telefone_apto: 0,\n};\n\nconst byEmail = new Map();\nconst byPhone = new Map();\n\nfor (const row of rows) {\n  const emailNorm = normalizeEmail(row.email);\n  if (row.email && !emailNorm) stats.email_sintaxe_invalida++;\n  if (emailNorm) {\n    const existing = byEmail.get(emailNorm);\n    if (!existing) {\n      byEmail.set(emailNorm, { _raw: row, contato_user_id: row.user_id, email_norm: emailNorm });\n    } else if (completeness(row) > completeness(existing._raw)) {\n      stats.email_duplicado++;\n      byEmail.set(emailNorm, { _raw: row, contato_user_id: row.user_id, email_norm: emailNorm });\n    } else {\n      stats.email_duplicado++;\n    }\n  }\n\n  const phoneNorm = normalizePhone(row.telefone);\n  if (row.telefone && !phoneNorm) stats.telefone_formato_invalido++;\n  if (phoneNorm) {\n    const existing = byPhone.get(phoneNorm);\n    if (!existing) {\n      byPhone.set(phoneNorm, { _raw: row, contato_user_id: row.user_id, telefone_e164: phoneNorm });\n    } else if (completeness(row) > completeness(existing._raw)) {\n      stats.telefone_duplicado++;\n      byPhone.set(phoneNorm, { _raw: row, contato_user_id: row.user_id, telefone_e164: phoneNorm });\n    } else {\n      stats.telefone_duplicado++;\n    }\n  }\n}\n\nconst validacoes = new Map();\n\nfunction getOrInit(userId) {\n  if (!validacoes.has(userId)) {\n    validacoes.set(userId, {\n      contato_user_id: userId,\n      email_norm: null,\n      telefone_e164: null,\n      email_apto: false,\n      whatsapp_apto: false,\n      motivo: null,\n    });\n  }\n  return validacoes.get(userId);\n}\n\nfor (const { contato_user_id, email_norm } of byEmail.values()) {\n  getOrInit(contato_user_id).email_norm = email_norm;\n}\nfor (const { contato_user_id, telefone_e164 } of byPhone.values()) {\n  getOrInit(contato_user_id).telefone_e164 = telefone_e164;\n}\n\n// Rotula quem perdeu a deduplicação (não venceu a disputa pelo email/telefone normalizado)\n// para que a linha em contatos_validacao não fique com motivo em branco.\nfor (const row of rows) {\n  const emailNorm = normalizeEmail(row.email);\n  if (emailNorm) {\n    const winner = byEmail.get(emailNorm);\n    if (winner && winner.contato_user_id !== row.user_id) {\n      const v = getOrInit(row.user_id);\n      v.motivo = v.motivo ? v.motivo + ';duplicado_email' : 'duplicado_email';\n    }\n  }\n  const phoneNorm = normalizePhone(row.telefone);\n  if (phoneNorm) {\n    const winner = byPhone.get(phoneNorm);\n    if (winner && winner.contato_user_id !== row.user_id) {\n      const v = getOrInit(row.user_id);\n      v.motivo = v.motivo ? v.motivo + ';duplicado_telefone' : 'duplicado_telefone';\n    }\n  }\n}\n\n// Checa MX de todos os domínios únicos em paralelo (lotes de 20), em vez de um por vez —\n// com milhares de contatos, checagem sequencial pode levar minutos.\nconst dominiosUnicos = [...new Set(\n  [...validacoes.values()].filter((v) => v.email_norm).map((v) => v.email_norm.split('@')[1])\n)];\n\nconst CONCORRENCIA = 20;\nconst mxResultado = new Map();\n\nfor (let i = 0; i < dominiosUnicos.length; i += CONCORRENCIA) {\n  const lote = dominiosUnicos.slice(i, i + CONCORRENCIA);\n  const resultados = await Promise.all(lote.map((d) => resolveMxComTimeout(d)));\n  lote.forEach((d, idx) => mxResultado.set(d, resultados[idx]));\n}\n\nfor (const v of validacoes.values()) {\n  if (v.email_norm) {\n    const domain = v.email_norm.split('@')[1];\n    if (mxResultado.get(domain)) {\n      v.email_apto = true;\n    } else {\n      stats.email_sem_mx++;\n      v.motivo = v.motivo ? v.motivo + ';sem_mx' : 'sem_mx';\n    }\n  }\n  if (v.telefone_e164) {\n    v.whatsapp_apto = true;\n  }\n}\n\nstats.email_apto = [...validacoes.values()].filter(v => v.email_apto).length;\nstats.telefone_apto = [...validacoes.values()].filter(v => v.whatsapp_apto).length;\n\nreturn [{ json: { validacoes: [...validacoes.values()], stats } }];"
+      },
+      "id": "normalizar",
+      "name": "Normalizar, Deduplicar, Checar MX",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ],
+      "notes": "Requer NODE_FUNCTION_ALLOW_BUILTIN=dns no ambiente do n8n."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO contatos_validacao (contato_user_id, email_norm, telefone_e164, email_apto, whatsapp_apto, motivo)\nSELECT * FROM jsonb_to_recordset($1::jsonb) AS t(\n  contato_user_id text, email_norm text, telefone_e164 text,\n  email_apto boolean, whatsapp_apto boolean, motivo text)\nON CONFLICT (contato_user_id) DO UPDATE SET\n  email_norm = EXCLUDED.email_norm,\n  telefone_e164 = EXCLUDED.telefone_e164,\n  email_apto = EXCLUDED.email_apto,\n  whatsapp_apto = EXCLUDED.whatsapp_apto,\n  motivo = EXCLUDED.motivo,\n  validado_em = now();",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.validacoes) ] }}"
+        }
+      },
+      "id": "upsert_validacao",
+      "name": "Upsert contatos_validacao",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        440,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      },
+      "notes": "Upsert em lote via jsonb_to_recordset — evita 1 round-trip por contato."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE contatos_validacao v\nSET email_apto = false,\n    motivo = CASE WHEN v.motivo IS NULL OR v.motivo = '' THEN 'suprimido' ELSE v.motivo || ';suprimido' END\nFROM supressao s\nWHERE s.canal = 'email' AND s.destino = v.email_norm AND v.email_apto = true;",
+        "options": {}
+      },
+      "id": "cruzar_supressao_email",
+      "name": "Cruzar Supressão (email)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        660,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE contatos_validacao v\nSET whatsapp_apto = false,\n    motivo = CASE WHEN v.motivo IS NULL OR v.motivo = '' THEN 'suprimido' ELSE v.motivo || ';suprimido' END\nFROM supressao s\nWHERE s.canal = 'whatsapp' AND s.destino = v.telefone_e164 AND v.whatsapp_apto = true;",
+        "options": {}
+      },
+      "id": "cruzar_supressao_wa",
+      "name": "Cruzar Supressão (whatsapp)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        880,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  count(*) FILTER (WHERE email_apto) AS email_aptos,\n  count(*) FILTER (WHERE email_norm IS NOT NULL AND NOT email_apto AND motivo ILIKE '%suprimido%') AS email_suprimidos_pos_validacao,\n  count(*) FILTER (WHERE whatsapp_apto) AS telefone_aptos,\n  count(*) FILTER (WHERE telefone_e164 IS NOT NULL AND NOT whatsapp_apto AND motivo ILIKE '%suprimido%') AS telefone_suprimidos_pos_validacao\nFROM contatos_validacao;",
+        "options": {}
+      },
+      "id": "relatorio_sql",
+      "name": "Contar Resultado Final",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const stats = $('Normalizar, Deduplicar, Checar MX').first().json.stats;\nconst cross = items[0].json;\n\nconst linhas = [\n  `Total em contatos:        ${stats.total_contatos}`,\n  ``,\n  `E-mails aptos:            ${cross.email_aptos}`,\n  `  descartados sintaxe:    ${stats.email_sintaxe_invalida}`,\n  `  descartados sem MX:     ${stats.email_sem_mx}`,\n  `  descartados duplicados: ${stats.email_duplicado}`,\n  `  descartados suprimidos: ${cross.email_suprimidos_pos_validacao}`,\n  ``,\n  `Telefones aptos:          ${cross.telefone_aptos}`,\n  `  descartados formato:    ${stats.telefone_formato_invalido}`,\n  `  descartados duplicados: ${stats.telefone_duplicado}`,\n  `  descartados suprimidos: ${cross.telefone_suprimidos_pos_validacao}`,\n].join('\\n');\n\nreturn [{ json: { relatorio: linhas, stats_brutos: stats, cruzamento_supressao: cross } }];"
+      },
+      "id": "relatorio",
+      "name": "Montar Relatório",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Executar Manualmente": {
+      "main": [
+        [
+          {
+            "node": "Ler Contatos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ler Contatos": {
+      "main": [
+        [
+          {
+            "node": "Normalizar, Deduplicar, Checar MX",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalizar, Deduplicar, Checar MX": {
+      "main": [
+        [
+          {
+            "node": "Upsert contatos_validacao",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert contatos_validacao": {
+      "main": [
+        [
+          {
+            "node": "Cruzar Supressão (email)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cruzar Supressão (email)": {
+      "main": [
+        [
+          {
+            "node": "Cruzar Supressão (whatsapp)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cruzar Supressão (whatsapp)": {
+      "main": [
+        [
+          {
+            "node": "Contar Resultado Final",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Contar Resultado Final": {
+      "main": [
+        [
+          {
+            "node": "Montar Relatório",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

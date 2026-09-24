@@ -1,0 +1,647 @@
+{
+  "name": "05 - Webhooks (Resend + WhatsApp + Descadastro)",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "whatsapp",
+        "responseMode": "responseNode",
+        "options": {},
+        "httpMethod": "GET"
+      },
+      "id": "wh_wa_verify",
+      "name": "Webhook WhatsApp Verify",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -200,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const crypto = require('crypto');\nconst q = items[0].json.query || {};\nconst verifyToken = $env.WA_VERIFY_TOKEN || '';\nconst recebido = q['hub.verify_token'] || '';\n\nlet tokenBate = false;\ntry {\n  const a = Buffer.from(recebido);\n  const b = Buffer.from(verifyToken);\n  tokenBate = a.length === b.length && crypto.timingSafeEqual(a, b);\n} catch (e) {\n  tokenBate = false;\n}\n\nconst ok = q['hub.mode'] === 'subscribe' && tokenBate;\nreturn [{ json: { ok, challenge: q['hub.challenge'] || '' } }];"
+      },
+      "id": "verif_wa_get",
+      "name": "Verificar Challenge Meta",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        20,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.ok ? $json.challenge : 'forbidden' }}",
+        "options": {
+          "responseCode": "={{ $json.ok ? 200 : 403 }}"
+        }
+      },
+      "id": "resp_wa_verify",
+      "name": "Responder Challenge (WhatsApp)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        240,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "path": "whatsapp",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        },
+        "httpMethod": "POST"
+      },
+      "id": "wh_wa_events",
+      "name": "Webhook WhatsApp Eventos",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -200,
+        140
+      ],
+      "notes": "Mesmo path do GET de verificação, método diferente — n8n roteia por método."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const crypto = require('crypto');\n\nconst item = items[0];\nconst rawB64 = item.binary && item.binary.data ? item.binary.data.data : null;\nconst rawBody = rawB64 ? Buffer.from(rawB64, 'base64').toString('utf8') : null;\n\nconst headers = item.json.headers || {};\nconst sigHeader = (headers['x-hub-signature-256'] || '').toString();\nconst secret = $env.WA_APP_SECRET || '';\n\nfunction verify() {\n  if (rawBody === null) return false; // sem raw body não há como validar — falha fechado\n  if (!sigHeader.startsWith('sha256=') || !secret) return false;\n  const provided = sigHeader.slice('sha256='.length);\n  let a, b;\n  try {\n    a = Buffer.from(provided, 'hex');\n    b = crypto.createHmac('sha256', secret).update(rawBody).digest();\n  } catch (e) {\n    return false;\n  }\n  if (a.length !== b.length) return false;\n  return crypto.timingSafeEqual(a, b);\n}\n\nconst valid = verify();\nlet body = {};\ntry {\n  body = item.json.body ?? JSON.parse(rawBody);\n} catch (e) {\n  body = {};\n}\n\nreturn [{ json: { valid, payloadRaw: body } }];"
+      },
+      "id": "verif_wa_post",
+      "name": "Verificar Assinatura Meta",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        20,
+        140
+      ],
+      "notes": "HMAC-SHA256 hex sobre o raw body, header X-Hub-Signature-256."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO eventos_webhook (canal, tipo, provider_message_id, payload)\nSELECT 'whatsapp', 'status', NULL, $1::jsonb\nWHERE $2::boolean = true;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.payloadRaw), $json.valid ] }}"
+        }
+      },
+      "id": "log_wa",
+      "name": "Gravar Evento Bruto (WhatsApp)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        240,
+        140
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const prev = $('Verificar Assinatura Meta').first().json;\nconst valid = prev.valid;\nconst body = prev.payloadRaw || {};\n\nif (!valid) {\n  return [{ json: { valid: false, sql: 'SELECT 0 AS no_op;', params: [], pausarCampanha: false } }];\n}\n\nconst statuses = [];\nfor (const entry of (body.entry || [])) {\n  for (const change of (entry.changes || [])) {\n    for (const st of ((change.value && change.value.statuses) || [])) statuses.push(st);\n  }\n}\n\nif (statuses.length === 0) {\n  return [{ json: { valid: true, sql: 'SELECT 0 AS no_op;', params: [], pausarCampanha: false } }];\n}\n\nconst CODIGOS_PERMANENTES = new Set(['131026']);\nconst CODIGOS_TEMPORARIOS = new Set(['131049', '130429']);\nconst CODIGOS_QUALIDADE = new Set(['131048']);\n\nfunction backoffSql() {\n  return `UPDATE envios SET\n            status = CASE WHEN tentativas >= 5 THEN 'falha' ELSE 'pendente' END,\n            erro_tipo = CASE WHEN tentativas >= 5 THEN 'permanente' ELSE 'temporario' END,\n            erro_codigo = $2, erro_mensagem = $3,\n            agendado_para = CASE tentativas\n              WHEN 1 THEN now() + interval '5 minutes'\n              WHEN 2 THEN now() + interval '15 minutes'\n              WHEN 3 THEN now() + interval '1 hour'\n              WHEN 4 THEN now() + interval '4 hours'\n              ELSE now() + interval '12 hours'\n            END,\n            atualizado_em = now()\n          WHERE provider_message_id = $1 AND canal = 'whatsapp' AND status NOT IN ('entregue','falha');`;\n}\n\nconst out = [];\nfor (const st of statuses) {\n  const providerMessageId = st.id;\n  const status = st.status;\n  const errorCode = (st.errors && st.errors[0]) ? String(st.errors[0].code) : null;\n  const errorMsg = (st.errors && st.errors[0]) ? (st.errors[0].title || '') : null;\n\n  let sql = 'SELECT 0 AS no_op;';\n  let params = [];\n  let pausarCampanha = false;\n\n  if (status === 'delivered') {\n    sql = `UPDATE envios SET status='entregue', entregue_em=now(), atualizado_em=now()\n           WHERE provider_message_id=$1 AND canal='whatsapp' AND status NOT IN ('entregue','falha');`;\n    params = [providerMessageId];\n  } else if (status === 'failed' && errorCode) {\n    if (CODIGOS_PERMANENTES.has(errorCode)) {\n      sql = `WITH alvo AS (\n               UPDATE envios SET status='falha', erro_tipo='permanente', erro_codigo=$2, erro_mensagem=$3, atualizado_em=now()\n               WHERE provider_message_id=$1 AND canal='whatsapp' AND status NOT IN ('entregue','falha')\n               RETURNING destino\n             )\n             INSERT INTO supressao (canal, destino, motivo)\n             SELECT 'whatsapp', destino, 'invalido' FROM alvo\n             ON CONFLICT (canal, destino) DO NOTHING;`;\n      params = [providerMessageId, errorCode, errorMsg];\n    } else if (errorCode === '131047') {\n      sql = `UPDATE envios SET status='falha', erro_tipo='permanente', erro_codigo=$2, erro_mensagem=$3, atualizado_em=now()\n             WHERE provider_message_id=$1 AND canal='whatsapp' AND status NOT IN ('entregue','falha');`;\n      params = [providerMessageId, errorCode, errorMsg];\n    } else if (CODIGOS_QUALIDADE.has(errorCode)) {\n      sql = backoffSql();\n      params = [providerMessageId, errorCode, errorMsg];\n      pausarCampanha = true;\n    } else if (CODIGOS_TEMPORARIOS.has(errorCode)) {\n      sql = backoffSql();\n      params = [providerMessageId, errorCode, errorMsg];\n    } else {\n      sql = backoffSql();\n      params = [providerMessageId, errorCode || 'desconhecido', errorMsg || 'codigo nao mapeado'];\n    }\n  }\n  // 'sent' e 'read': apenas registrar — já coberto pelo log em eventos_webhook; sql fica no-op.\n\n  out.push({ json: { valid: true, providerMessageId, status, errorCode, sql, params, pausarCampanha } });\n}\nreturn out;"
+      },
+      "id": "classif_wa",
+      "name": "Classificar e Expandir Status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        140
+      ],
+      "notes": "Um item de saída por status[] do payload — cada um vira uma execução do Postgres seguinte."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.sql }}",
+        "options": {
+          "queryReplacement": "={{ $json.params }}"
+        }
+      },
+      "id": "transicao_wa",
+      "name": "Aplicar Transição (WhatsApp)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        680,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE campanhas SET pausada = true,\n  motivo_pausa = 'Limite de qualidade WhatsApp (131048) em ' || now()::text\nWHERE id = (SELECT campanha_id FROM envios WHERE provider_message_id = $1 LIMIT 1)\n  AND $2::boolean = true AND pausada = false;",
+        "options": {
+          "queryReplacement": "={{ [ $('Classificar e Expandir Status').all()[$itemIndex].json.providerMessageId, $('Classificar e Expandir Status').all()[$itemIndex].json.pausarCampanha ] }}"
+        }
+      },
+      "id": "pausar_wa",
+      "name": "Pausar Campanha se Necessário",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        680,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const valid = $('Verificar Assinatura Meta').first().json.valid;\nreturn [{ json: { httpStatus: valid ? 200 : 401, body: valid ? { received: true } : { error: 'invalid signature' } } }];"
+      },
+      "id": "resp_calc_wa",
+      "name": "Montar Resposta (WhatsApp)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.body }}",
+        "options": {
+          "responseCode": "={{ $json.httpStatus }}"
+        }
+      },
+      "id": "resp_wa_events",
+      "name": "Responder (WhatsApp Eventos)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1120,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "path": "descadastro",
+        "responseMode": "responseNode",
+        "options": {},
+        "httpMethod": "GET"
+      },
+      "id": "wh_desc",
+      "name": "Webhook Descadastro",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -200,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const crypto = require('crypto');\nconst q = items[0].json.query || {};\nconst u = q.u || '';\nconst e = (q.e || '').toLowerCase();\nconst t = q.t || '';\nconst secret = $env.UNSUBSCRIBE_HMAC_SECRET || '';\n\nconst expected = crypto.createHmac('sha256', secret).update(`${u}:${e}`).digest('hex');\n\nlet valid = false;\ntry {\n  const a = Buffer.from(t, 'hex');\n  const b = Buffer.from(expected, 'hex');\n  valid = a.length === b.length && crypto.timingSafeEqual(a, b);\n} catch (err) {\n  valid = false;\n}\n\nreturn [{ json: { valid, contatoUserId: u, email: e } }];"
+      },
+      "id": "valid_desc",
+      "name": "Validar Token Descadastro",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        20,
+        340
+      ],
+      "notes": "Token = HMAC-SHA256(UNSUBSCRIBE_HMAC_SECRET, `${contato_user_id}:${email}`). Gerado no workflow 03-disparar-email ao montar o link List-Unsubscribe."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH ins AS (\n  INSERT INTO supressao (canal, destino, motivo)\n  SELECT 'email', $1, 'descadastro'\n  WHERE $2::boolean = true\n  ON CONFLICT (canal, destino) DO NOTHING\n  RETURNING destino\n), upd AS (\n  UPDATE envios SET status='suprimido', atualizado_em=now()\n  WHERE canal='email' AND destino = $1 AND status='pendente' AND $2::boolean = true\n  RETURNING id\n)\nSELECT (SELECT count(*) FROM ins) AS supressao_inserida, (SELECT count(*) FROM upd) AS envios_marcados;",
+        "options": {
+          "queryReplacement": "={{ [ $json.email, $json.valid ] }}"
+        }
+      },
+      "id": "supressao_desc",
+      "name": "Registrar Supressão e Marcar Pendentes",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        240,
+        340
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      },
+      "notes": "Ambas as CTEs precisam ser referenciadas pelo SELECT final, senão o Postgres não as executa."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const valid = $('Validar Token Descadastro').first().json.valid;\nconst okHtml = `<!doctype html><html><head><meta charset=\"utf-8\">\n<title>Descadastro confirmado</title></head>\n<body style=\"font-family: sans-serif; max-width: 480px; margin: 60px auto; text-align:center;\">\n<h1>Voce foi removido da nossa lista</h1>\n<p>Nao enviaremos mais mensagens de campanha para este contato.</p>\n</body></html>`;\nconst badHtml = `<!doctype html><html><head><meta charset=\"utf-8\">\n<title>Link invalido</title></head>\n<body style=\"font-family: sans-serif; max-width: 480px; margin: 60px auto; text-align:center;\">\n<h1>Link invalido ou corrompido</h1>\n</body></html>`;\nreturn [{ json: { httpStatus: valid ? 200 : 400, html: valid ? okHtml : badHtml } }];"
+      },
+      "id": "html_desc",
+      "name": "Montar Página de Confirmação",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.html }}",
+        "options": {
+          "responseCode": "={{ $json.httpStatus }}",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              }
+            ]
+          }
+        }
+      },
+      "id": "resp_desc",
+      "name": "Responder (Descadastro)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        680,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "path": "sendgrid",
+        "responseMode": "responseNode",
+        "httpMethod": "POST",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "wh_sendgrid",
+      "name": "Webhook SendGrid",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -200,
+        -300
+      ],
+      "notes": "Path final: /webhook/sendgrid (o node já prefixa 'webhook/' automaticamente)."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const crypto = require('crypto');\n\nconst item = items[0];\nconst rawB64 = item.binary && item.binary.data ? item.binary.data.data : null;\nconst rawBody = rawB64 ? Buffer.from(rawB64, 'base64') : null;\n\nconst headers = item.json.headers || {};\nconst timestamp = headers['x-twilio-email-event-webhook-timestamp'];\nconst signature = headers['x-twilio-email-event-webhook-signature'];\n\nconst PUBLIC_KEY_PEM = `-----BEGIN PUBLIC KEY-----\\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEatxLRAgVvnVNbp8OS7YIdZEx5Kmu\\n5I27nlrvGKxE7hhEnYAGiXoJMsieIk2e0WzuS6G9khi2oxct2EmgRK3Ymw==\\n-----END PUBLIC KEY-----`;\n\nfunction verify() {\n  if (rawBody === null || !timestamp || !signature) return false;\n  try {\n    const publicKey = crypto.createPublicKey({ key: PUBLIC_KEY_PEM, format: 'pem' });\n    const signedPayload = Buffer.concat([Buffer.from(String(timestamp), 'utf8'), rawBody]);\n    const sigBuf = Buffer.from(signature, 'base64');\n    return crypto.verify('sha256', signedPayload, publicKey, sigBuf);\n  } catch (e) {\n    return false;\n  }\n}\n\nconst valid = verify();\n\nlet eventos = [];\ntry {\n  const parsed = item.json.body ?? JSON.parse(rawBody ? rawBody.toString('utf8') : '[]');\n  eventos = Array.isArray(parsed) ? parsed : [];\n} catch (e) {\n  eventos = [];\n}\n\nreturn [{ json: { valid, eventos } }];"
+      },
+      "id": "verif_sendgrid",
+      "name": "Verificar Assinatura SendGrid",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        20,
+        -300
+      ],
+      "notes": "ECDSA P-256, SHA-256 sobre timestamp+rawBody (bytes concatenados, sem separador). Chave pública obtida no painel SendGrid ao salvar o Signed Event Webhook. IMPORTANTE: verificado o formato da chave via OpenSSL, mas a aceitação de uma assinatura REAL válida não foi testada de ponta a ponta (não tenho a chave privada da SendGrid pra gerar um evento assinado de teste) — use o botão 'Test Integration' da SendGrid depois de ativar este workflow para validar de verdade."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO eventos_webhook (canal, tipo, provider_message_id, payload)\nSELECT 'email', 'sendgrid_batch', NULL, $1::jsonb\nWHERE $2::boolean = true;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.eventos), $json.valid ] }}"
+        }
+      },
+      "id": "log_sendgrid",
+      "name": "Gravar Evento Bruto (SendGrid)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        240,
+        -300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      },
+      "notes": "A SendGrid manda um ARRAY de eventos por chamada de webhook — grava o lote bruto inteiro."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const prev = $('Verificar Assinatura SendGrid').first().json;\nconst valid = prev.valid;\nconst eventos = prev.eventos || [];\n\nif (!valid || eventos.length === 0) {\n  return [{ json: { valid, sql: 'SELECT 0 AS no_op;', params: [], pausarCampanha: false } }];\n}\n\nfunction backoffSql() {\n  return `UPDATE envios SET\n            status = CASE WHEN tentativas >= 5 THEN 'falha' ELSE 'pendente' END,\n            erro_tipo = CASE WHEN tentativas >= 5 THEN 'permanente' ELSE 'temporario' END,\n            erro_codigo = $2, erro_mensagem = $3,\n            agendado_para = CASE tentativas\n              WHEN 1 THEN now() + interval '5 minutes'\n              WHEN 2 THEN now() + interval '15 minutes'\n              WHEN 3 THEN now() + interval '1 hour'\n              WHEN 4 THEN now() + interval '4 hours'\n              ELSE now() + interval '12 hours'\n            END,\n            atualizado_em = now()\n          WHERE id = $1 AND canal = 'email' AND status NOT IN ('entregue','falha');`;\n}\n\nconst out = [];\nfor (const ev of eventos) {\n  // envio_id vem de custom_args, setado no momento do envio (03-disparar-email) — é a\n  // correlação confiável. sg_message_id NÃO bate exatamente com o X-Message-Id retornado\n  // no envio (a SendGrid concatena sufixos), então não usamos ele para correlacionar.\n  const envioId = ev.envio_id ? parseInt(ev.envio_id, 10) : null;\n  const tipo = ev.event;\n  const bounceType = ev.type || null; // em eventos \"bounce\": 'bounce' (hard) | 'blocked' (soft)\n\n  let sql = 'SELECT 0 AS no_op;';\n  let params = [];\n  let pausarCampanha = false;\n\n  if (!envioId) {\n    out.push({ json: { valid: true, envioId: null, tipo, sql, params, pausarCampanha } });\n    continue;\n  }\n\n  if (tipo === 'delivered') {\n    sql = `UPDATE envios SET status='entregue', entregue_em=now(), atualizado_em=now()\n           WHERE id=$1 AND canal='email' AND status NOT IN ('entregue','falha');`;\n    params = [envioId];\n  } else if (tipo === 'open') {\n    sql = `UPDATE envios SET aberto_em = COALESCE(aberto_em, now()), atualizado_em=now()\n           WHERE id=$1 AND canal='email';`;\n    params = [envioId];\n  } else if (tipo === 'bounce' && bounceType === 'bounce') {\n    sql = `WITH alvo AS (\n             UPDATE envios SET status='falha', erro_tipo='permanente', erro_codigo='bounce_hard',\n                    erro_mensagem=$2, atualizado_em=now()\n             WHERE id=$1 AND canal='email' AND status NOT IN ('entregue','falha')\n             RETURNING destino\n           )\n           INSERT INTO supressao (canal, destino, motivo)\n           SELECT 'email', destino, 'hard_bounce' FROM alvo\n           ON CONFLICT (canal, destino) DO NOTHING;`;\n    params = [envioId, (ev.reason || '').toString().slice(0, 500)];\n  } else if (tipo === 'dropped') {\n    sql = `WITH alvo AS (\n             UPDATE envios SET status='falha', erro_tipo='permanente', erro_codigo='dropped',\n                    erro_mensagem=$2, atualizado_em=now()\n             WHERE id=$1 AND canal='email' AND status NOT IN ('entregue','falha')\n             RETURNING destino\n           )\n           INSERT INTO supressao (canal, destino, motivo)\n           SELECT 'email', destino, 'invalido' FROM alvo\n           ON CONFLICT (canal, destino) DO NOTHING;`;\n    params = [envioId, (ev.reason || '').toString().slice(0, 500)];\n  } else if (tipo === 'spamreport') {\n    sql = `WITH alvo AS (\n             UPDATE envios SET status='falha', erro_tipo='permanente', erro_codigo='reclamacao',\n                    erro_mensagem='complaint', atualizado_em=now()\n             WHERE id=$1 AND canal='email' AND status NOT IN ('entregue','falha')\n             RETURNING destino\n           )\n           INSERT INTO supressao (canal, destino, motivo)\n           SELECT 'email', destino, 'reclamacao' FROM alvo\n           ON CONFLICT (canal, destino) DO NOTHING;`;\n    params = [envioId];\n  } else if (tipo === 'unsubscribe' || tipo === 'group_unsubscribe') {\n    sql = `WITH alvo AS (\n             UPDATE envios SET status='suprimido', atualizado_em=now()\n             WHERE id=$1 AND canal='email' AND status = 'pendente'\n             RETURNING destino\n           )\n           INSERT INTO supressao (canal, destino, motivo)\n           SELECT 'email', destino, 'descadastro' FROM alvo\n           ON CONFLICT (canal, destino) DO NOTHING;`;\n    params = [envioId];\n  } else if (tipo === 'bounce' || tipo === 'deferred') {\n    // 'bounce' com type desconhecido (não veio 'bounce' nem 'blocked' claramente) ou\n    // 'deferred': trata como temporário — mais seguro que suprimir um contato válido à toa.\n    sql = backoffSql();\n    params = [envioId, tipo, (ev.reason || 'sem detalhe').toString().slice(0, 500)];\n  }\n  // 'processed', 'click' e tipos não mapeados: sql fica no-op (já registrado em eventos_webhook).\n\n  out.push({ json: { valid: true, envioId, tipo, sql, params, pausarCampanha } });\n}\nreturn out;"
+      },
+      "id": "classif_sendgrid",
+      "name": "Classificar e Expandir Eventos (SendGrid)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        -300
+      ],
+      "notes": "Um item de saída por evento do array. Correlaciona por 'envio_id' (custom_args setado no envio, não pelo sg_message_id — esses não batem exatamente)."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.sql }}",
+        "options": {
+          "queryReplacement": "={{ $json.params }}"
+        }
+      },
+      "id": "transicao_sendgrid",
+      "name": "Aplicar Transição (SendGrid)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        680,
+        -300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const valid = $('Verificar Assinatura SendGrid').first().json.valid;\nreturn [{ json: { httpStatus: valid ? 200 : 401, body: valid ? { ok: true } : { error: 'invalid signature' } } }];"
+      },
+      "id": "resp_calc_sendgrid",
+      "name": "Montar Resposta (SendGrid)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        -300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.body }}",
+        "options": {
+          "responseCode": "={{ $json.httpStatus }}"
+        }
+      },
+      "id": "resp_sendgrid",
+      "name": "Responder (SendGrid)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1120,
+        -300
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook WhatsApp Verify": {
+      "main": [
+        [
+          {
+            "node": "Verificar Challenge Meta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verificar Challenge Meta": {
+      "main": [
+        [
+          {
+            "node": "Responder Challenge (WhatsApp)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook WhatsApp Eventos": {
+      "main": [
+        [
+          {
+            "node": "Verificar Assinatura Meta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verificar Assinatura Meta": {
+      "main": [
+        [
+          {
+            "node": "Gravar Evento Bruto (WhatsApp)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gravar Evento Bruto (WhatsApp)": {
+      "main": [
+        [
+          {
+            "node": "Classificar e Expandir Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classificar e Expandir Status": {
+      "main": [
+        [
+          {
+            "node": "Aplicar Transição (WhatsApp)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aplicar Transição (WhatsApp)": {
+      "main": [
+        [
+          {
+            "node": "Pausar Campanha se Necessário",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pausar Campanha se Necessário": {
+      "main": [
+        [
+          {
+            "node": "Montar Resposta (WhatsApp)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Montar Resposta (WhatsApp)": {
+      "main": [
+        [
+          {
+            "node": "Responder (WhatsApp Eventos)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Descadastro": {
+      "main": [
+        [
+          {
+            "node": "Validar Token Descadastro",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validar Token Descadastro": {
+      "main": [
+        [
+          {
+            "node": "Registrar Supressão e Marcar Pendentes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Registrar Supressão e Marcar Pendentes": {
+      "main": [
+        [
+          {
+            "node": "Montar Página de Confirmação",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Montar Página de Confirmação": {
+      "main": [
+        [
+          {
+            "node": "Responder (Descadastro)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook SendGrid": {
+      "main": [
+        [
+          {
+            "node": "Verificar Assinatura SendGrid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verificar Assinatura SendGrid": {
+      "main": [
+        [
+          {
+            "node": "Gravar Evento Bruto (SendGrid)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gravar Evento Bruto (SendGrid)": {
+      "main": [
+        [
+          {
+            "node": "Classificar e Expandir Eventos (SendGrid)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classificar e Expandir Eventos (SendGrid)": {
+      "main": [
+        [
+          {
+            "node": "Aplicar Transição (SendGrid)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aplicar Transição (SendGrid)": {
+      "main": [
+        [
+          {
+            "node": "Montar Resposta (SendGrid)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Montar Resposta (SendGrid)": {
+      "main": [
+        [
+          {
+            "node": "Responder (SendGrid)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

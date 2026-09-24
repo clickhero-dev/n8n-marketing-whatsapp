@@ -1,0 +1,215 @@
+{
+  "name": "02 - Enfileirar Campanha",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "trigger02",
+      "name": "Executar Manualmente",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -400,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Edite estes valores antes de cada execução da campanha.\nreturn [{\n  json: {\n    campanha_id: 1,\n    curva: 'padrao',            // 'padrao' (8.1, cenário B) ou 'acelerada' (8.2, cenários A/D)\n    data_inicio: '2026-08-17',  // primeiro dia útil de disparo, formato YYYY-MM-DD\n    wa_tier_limite: 1000,       // limite diário do tier no WhatsApp Manager (seção 1.2)\n  },\n}];"
+      },
+      "id": "params02",
+      "name": "Parâmetros",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -180,
+        0
+      ],
+      "notes": "Edite campanha_id / curva / data_inicio / wa_tier_limite antes de rodar."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO envios (campanha_id, contato_user_id, canal, destino)\nSELECT $1, v.contato_user_id, 'email', v.email_norm\nFROM contatos_validacao v\nJOIN members m ON m.user_id::text = v.contato_user_id\nWHERE v.email_apto\n  AND NOT EXISTS (SELECT 1 FROM supressao s WHERE s.canal='email' AND s.destino = v.email_norm)\n  AND NOT (\n    m.cidade ILIKE '%são paulo%' OR m.cidade ILIKE '%sao paulo%'\n    OR m.cidade ILIKE '%santo andré%' OR m.cidade ILIKE '%santo andre%'\n    OR m.cidade ILIKE '%são bernardo%' OR m.cidade ILIKE '%sao bernardo%'\n    OR m.cidade ILIKE '%são caetano%' OR m.cidade ILIKE '%sao caetano%'\n    OR m.cidade ILIKE '%diadema%'\n    OR m.cidade ILIKE '%mau%'\n    OR m.cidade ILIKE '%joinville%'\n    OR m.especialidade LIKE 'Direito %'\n    OR (m.especialidade = 'Especialista em Direito e Contabilidade' AND m.especialidade_detalhada ILIKE '%direito%')\n    OR m.especialidade_detalhada ILIKE '%tráfego%' OR m.especialidade_detalhada ILIKE '%trafego%'\n  )\nON CONFLICT ON CONSTRAINT ux_envio DO NOTHING;",
+        "options": {
+          "queryReplacement": "={{ [ $json.campanha_id ] }}"
+        }
+      },
+      "id": "enfileirar_email",
+      "name": "Enfileirar E-mail",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        40,
+        -60
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      },
+      "notes": "Exclui: São Paulo capital, ABC Paulista (Santo André/São Bernardo/São Caetano/Diadema/Mauá), Joinville, Advogados (especialidade 'Direito %'), Gestor de Tráfego (especialidade_detalhada contém 'tráfego')."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO envios (campanha_id, contato_user_id, canal, destino)\nSELECT $1, v.contato_user_id, 'whatsapp', v.telefone_e164\nFROM contatos_validacao v\nJOIN members m ON m.user_id::text = v.contato_user_id\nWHERE v.whatsapp_apto\n  AND NOT EXISTS (SELECT 1 FROM supressao s WHERE s.canal='whatsapp' AND s.destino = v.telefone_e164)\n  AND NOT (\n    m.cidade ILIKE '%são paulo%' OR m.cidade ILIKE '%sao paulo%'\n    OR m.cidade ILIKE '%santo andré%' OR m.cidade ILIKE '%santo andre%'\n    OR m.cidade ILIKE '%são bernardo%' OR m.cidade ILIKE '%sao bernardo%'\n    OR m.cidade ILIKE '%são caetano%' OR m.cidade ILIKE '%sao caetano%'\n    OR m.cidade ILIKE '%diadema%'\n    OR m.cidade ILIKE '%mau%'\n    OR m.cidade ILIKE '%joinville%'\n    OR m.especialidade LIKE 'Direito %'\n    OR (m.especialidade = 'Especialista em Direito e Contabilidade' AND m.especialidade_detalhada ILIKE '%direito%')\n    OR m.especialidade_detalhada ILIKE '%tráfego%' OR m.especialidade_detalhada ILIKE '%trafego%'\n  )\nON CONFLICT ON CONSTRAINT ux_envio DO NOTHING;",
+        "options": {
+          "queryReplacement": "={{ [ $('Parâmetros').first().json.campanha_id ] }}"
+        }
+      },
+      "id": "enfileirar_wa",
+      "name": "Enfileirar WhatsApp",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        260,
+        -60
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      },
+      "notes": "Mesma regra de exclusão do node de e-mail."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT canal, count(*) AS contagem FROM envios WHERE campanha_id = $1 GROUP BY canal;",
+        "options": {
+          "queryReplacement": "={{ [ $('Parâmetros').first().json.campanha_id ] }}"
+        }
+      },
+      "id": "contar_enfileirados",
+      "name": "Contar Enfileirados",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        480,
+        -60
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const params = $('Parâmetros').first().json;\n\nconst counts = {};\nfor (const it of items) {\n  counts[it.json.canal] = parseInt(it.json.contagem, 10) || 0;\n}\nconst totalEmail = counts.email || 0;\n\nconst CURVA_PADRAO = [200, 500, 1200, 2000, 2500, 2500];\nconst CURVA_ACELERADA = [500, 1500, 3000, 3000];\nconst curva = params.curva === 'acelerada' ? CURVA_ACELERADA : CURVA_PADRAO;\n\nfunction proximoDiaUtil(d) {\n  while (d.getUTCDay() === 0 || d.getUTCDay() === 6) {\n    d = new Date(d.getTime() + 86400000);\n  }\n  return d;\n}\n\nfunction gerarDias(qtd) {\n  const dias = [];\n  let d = proximoDiaUtil(new Date(params.data_inicio + 'T00:00:00Z'));\n  for (let i = 0; i < qtd; i++) {\n    dias.push(d.toISOString().slice(0, 10));\n    d = proximoDiaUtil(new Date(d.getTime() + 86400000));\n  }\n  return dias;\n}\n\nconst dias = gerarDias(curva.length + 1); // +1 = dia final com o \"restante\"\nconst acumuladoCurva = curva.reduce((a, b) => a + b, 0);\nconst restante = Math.max(totalEmail - acumuladoCurva, 0);\nconst limitesEmail = [...curva, restante];\n\nconst waLimiteDiario = Math.max(Math.floor((params.wa_tier_limite || 0) * 0.9), 0);\n\nconst linhas = [];\ndias.forEach((dia, i) => {\n  linhas.push({ campanha_id: params.campanha_id, canal: 'email', dia, limite: limitesEmail[i] });\n  linhas.push({ campanha_id: params.campanha_id, canal: 'whatsapp', dia, limite: waLimiteDiario });\n});\n\nreturn [{ json: { linhas, totalEmail } }];"
+      },
+      "id": "rampa02",
+      "name": "Calcular Rampa",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        -60
+      ],
+      "notes": "Curva 8.1 (padrão) ou 8.2 (acelerada) da spec; último dia recebe o restante até completar a base."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO cota_diaria (campanha_id, canal, dia, limite)\nSELECT * FROM jsonb_to_recordset($1::jsonb) AS t(campanha_id int, canal text, dia date, limite int)\nON CONFLICT (campanha_id, canal, dia) DO UPDATE SET limite = EXCLUDED.limite;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.linhas) ] }}"
+        }
+      },
+      "id": "popular_cota",
+      "name": "Popular Cota Diária",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        920,
+        -60
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Executar Manualmente": {
+      "main": [
+        [
+          {
+            "node": "Parâmetros",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parâmetros": {
+      "main": [
+        [
+          {
+            "node": "Enfileirar E-mail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enfileirar E-mail": {
+      "main": [
+        [
+          {
+            "node": "Enfileirar WhatsApp",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enfileirar WhatsApp": {
+      "main": [
+        [
+          {
+            "node": "Contar Enfileirados",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Contar Enfileirados": {
+      "main": [
+        [
+          {
+            "node": "Calcular Rampa",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calcular Rampa": {
+      "main": [
+        [
+          {
+            "node": "Popular Cota Diária",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

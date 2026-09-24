@@ -1,0 +1,351 @@
+{
+  "name": "03 - Disparar E-mail",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/10 9-18 * * 1-6"
+            }
+          ]
+        }
+      },
+      "id": "trigger03",
+      "name": "A Cada 10 Minutos (09-18h seg-sáb)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -680,
+        0
+      ],
+      "notes": "Timezone vem de GENERIC_TIMEZONE=America/Sao_Paulo no docker-compose. A janela também é reconfirmada dentro do workflow (guarda redundante, spec 7.1)."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "return [{\n  json: {\n    campanha_id: 1,       // mesmo id usado em 02-enfileirar\n    tamanho_lote_padrao: 100,\n  },\n}];"
+      },
+      "id": "params03",
+      "name": "Parâmetros",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -460,
+        0
+      ],
+      "notes": "Edite campanha_id se for outra campanha."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT c.id, c.pausada, c.modo_whitelist, c.assunto_email, cd.limite, cd.usado\nFROM campanhas c\nLEFT JOIN cota_diaria cd ON cd.campanha_id = c.id AND cd.canal = 'email'\n  AND cd.dia = (now() AT TIME ZONE 'America/Sao_Paulo')::date\nWHERE c.id = $1;",
+        "options": {
+          "queryReplacement": "={{ [ $json.campanha_id ] }}"
+        }
+      },
+      "id": "guardas03",
+      "name": "Checar Guardas",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -240,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const g = items[0].json;\nconst params = $('Parâmetros').first().json;\n\nconst partes = new Intl.DateTimeFormat('en-US', {\n  timeZone: 'America/Sao_Paulo', hour: 'numeric', hour12: false, weekday: 'short',\n}).formatToParts(new Date());\nconst hora = parseInt(partes.find((p) => p.type === 'hour').value, 10);\nconst diaSemana = partes.find((p) => p.type === 'weekday').value; // 'Mon'..'Sun'\n\nconst diaUtil = diaSemana !== 'Sun'; // permite sábado — só domingo fica de fora\nconst dentroDaJanela = diaUtil && hora >= 9 && hora < 18;\n\nconst limite = g.limite != null ? parseInt(g.limite, 10) : 0;\nconst usado = g.usado != null ? parseInt(g.usado, 10) : 0;\nconst cotaRestante = Math.max(limite - usado, 0);\n\nlet bloqueadoMotivo = null;\nif (!g.id) bloqueadoMotivo = 'campanha_inexistente';\nelse if (g.pausada) bloqueadoMotivo = 'campanha_pausada';\nelse if (!dentroDaJanela) bloqueadoMotivo = 'fora_da_janela';\nelse if (cotaRestante <= 0) bloqueadoMotivo = 'cota_esgotada';\n\nconst tamanhoLote = bloqueadoMotivo ? 0 : Math.min(params.tamanho_lote_padrao, cotaRestante);\n\nreturn [{\n  json: {\n    campanha_id: params.campanha_id,\n    modo_whitelist: !!g.modo_whitelist,\n    assunto_email: g.assunto_email,\n    tamanho_lote: tamanhoLote,\n    bloqueado_motivo: bloqueadoMotivo,\n  },\n}];"
+      },
+      "id": "avaliar03",
+      "name": "Avaliar Guardas",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -20,
+        0
+      ],
+      "notes": "pausada / fora da janela / cota esgotada => tamanho_lote=0, e o claim seguinte não pega nada."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH lote AS (\n  SELECT e.id, e.contato_user_id\n  FROM envios e\n  WHERE e.campanha_id = $1\n    AND e.canal = 'email'\n    AND e.status = 'pendente'\n    AND e.agendado_para <= now()\n    AND ($2::boolean = false OR EXISTS (\n          SELECT 1 FROM whitelist w WHERE w.canal = 'email' AND w.destino = e.destino))\n  ORDER BY e.id\n  LIMIT $3\n  FOR UPDATE SKIP LOCKED\n)\nUPDATE envios e\nSET status = 'enviando', locked_at = now(), tentativas = e.tentativas + 1, atualizado_em = now()\nFROM lote\nJOIN members c ON c.user_id::text = lote.contato_user_id\nWHERE e.id = lote.id\nRETURNING e.id, e.destino, e.contato_user_id, c.nome;",
+        "options": {
+          "queryReplacement": "={{ [ $json.campanha_id, $json.modo_whitelist, $json.tamanho_lote ] }}"
+        }
+      },
+      "id": "claim03",
+      "name": "Claim Atômico do Lote",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        200,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      },
+      "notes": "FOR UPDATE SKIP LOCKED permite múltiplos workers em paralelo sem pegar a mesma linha. 0 linhas claimed = 0 items = o resto do workflow simplesmente não roda nesta execução."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const crypto = require('crypto');\n\nconst campanha = $('Avaliar Guardas').first().json;\nconst secret = $env.UNSUBSCRIBE_HMAC_SECRET || '';\nconst webhookBase = ($env.WEBHOOK_URL || '').replace(/\\/$/, '');\nconst fromAddr = $env.SENDGRID_FROM;\n\nconst EVENTO_DATA = '1 de setembro às 20h';\nconst EVENTO_LINK = 'https://www.useady.com.br/workshop';\nconst MEET_LINK = 'https://meet.google.com/aoi-orjx-ouj';\n\nfunction tokenDescadastro(userId, email) {\n  return crypto.createHmac('sha256', secret).update(`${userId}:${email}`).digest('hex');\n}\n\n// Corpo do e-mail por campanha — cada campanha_id tem seu próprio texto.\nconst PARAGRAFOS_POR_CAMPANHA = {\n  // Campanha 1 — Convite original\n  1: (nome) => [\n    nome ? `Olá ${nome},` : 'Olá,',\n    'Aqui é o Jean, membro do BNI DECISION de Joinville, tudo bem?',\n    'Eu montei um workshop na qual eu vou revelar uma forma de você atrair mais clientes todo dia '\n      + 'para o seu negócio através da internet, com uma ferramenta online na qual você vai investir '\n      + 'menos de R$ 500 por mês e que vai substituir uma agência completa, na qual você gastaria '\n      + 'talvez mais de R$ 2.000 por mês para ela fazer a mesma coisa.',\n    `Esse workshop vai acontecer no dia ${EVENTO_DATA} e será EXCLUSIVO para membros do BNI.`,\n    `A inscrição é 100% GRÁTIS e pode ser realizada aqui: ${EVENTO_LINK}`,\n    'Posso contar contigo?',\n  ],\n  // Campanha 3 — Lembrete 2: \"Amanhã, mesmo horário\" (Seg 31/08 20h)\n  3: (nome) => [\n    nome ? `Oi ${nome},` : 'Oi,',\n    'Amanhã, terça, 20h — exatamente essa hora — começa o workshop \"O Instagram que vende sozinho\".',\n    `O link de acesso é este: ${MEET_LINK}`,\n    'Guarda esse email ou salva o link em algum lugar fácil de achar amanhã à noite. São só 60 minutos '\n      + 'e não vai ter segunda chance de assistir depois.',\n    'Te vejo lá.',\n    'Jean Dentz',\n  ],\n  // Campanha 5 — Lembrete 4: \"Começa em 2 horas\" (Ter 01/09 18h)\n  5: (nome) => [\n    nome ? `Oi ${nome},` : 'Oi,',\n    'Faltam 2 horas. O workshop \"O Instagram que vende sozinho\" começa às 20h.',\n    `Acesso direto: ${MEET_LINK}`,\n    'Entra 5 minutos antes pra já garantir sua conexão. Não vai ter gravação — quem perder, perde mesmo.',\n    'Abraço,',\n    'Jean Dentz',\n  ],\n};\n\nconst montarParagrafos = PARAGRAFOS_POR_CAMPANHA[campanha.campanha_id];\nif (!montarParagrafos) {\n  throw new Error(`Campanha de e-mail sem texto cadastrado: campanha_id=${campanha.campanha_id}. Adicione em PARAGRAFOS_POR_CAMPANHA.`);\n}\n\nreturn items.map((it) => {\n  const { id, destino, contato_user_id, nome } = it.json;\n  const token = tokenDescadastro(contato_user_id, destino);\n  const unsubUrl = `${webhookBase}/webhook/descadastro?u=${encodeURIComponent(contato_user_id)}`\n    + `&e=${encodeURIComponent(destino)}&t=${token}`;\n\n  const paragrafos = montarParagrafos(nome);\n  const html = paragrafos.map((p) => `<p>${p}</p>`).join('\\n')\n    + `<p><a href=\"${unsubUrl}\">Descadastrar</a></p>`;\n  const text = paragrafos.join('\\n\\n') + `\\n\\nDescadastrar: ${unsubUrl}`;\n\n  const corpo = {\n    personalizations: [\n      { to: [{ email: destino }], custom_args: { envio_id: String(id) } },\n    ],\n    from: { email: fromAddr },\n    subject: campanha.assunto_email,\n    content: [\n      { type: 'text/plain', value: text },\n      { type: 'text/html', value: html },\n    ],\n    headers: {\n      'List-Unsubscribe': `<${unsubUrl}>, <mailto:descadastro@envios.seudominio.com.br>`,\n      'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',\n    },\n  };\n\n  return { json: { ...it.json, corpoJson: JSON.stringify(corpo) } };\n});"
+      },
+      "id": "montarcorpo03",
+      "name": "Montar Corpo do E-mail (SendGrid)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        0
+      ],
+      "notes": "Corpo montado como STRING JSON (JSON.stringify) — chaves aninhadas direto na expressão do node HTTP confundem o parser do n8n (mesmo bug encontrado no 04)."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.sendgrid.com/v3/mail/send",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "batching": {
+            "batch": {
+              "batchSize": 10,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.corpoJson }}",
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $env.SENDGRID_API_KEY }}"
+            }
+          ]
+        }
+      },
+      "id": "enviar03",
+      "name": "Enviar E-mail (SendGrid)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        640,
+        0
+      ],
+      "notes": "1 requisição por destinatário — a API da SendGrid compartilha um único 'content' entre todas as personalizations de uma chamada, o que quebraria o link de descadastro individual. custom_args.envio_id é o que o webhook usa pra correlacionar depois. neverError+fullResponse pra nunca lançar exceção e poder ler o header X-Message-Id."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const claimed = $('Claim Atômico do Lote').all();\n\nfunction backoffSql() {\n  return `UPDATE envios SET\n            status = CASE WHEN tentativas >= 5 THEN 'falha' ELSE 'pendente' END,\n            erro_tipo = CASE WHEN tentativas >= 5 THEN 'permanente' ELSE 'temporario' END,\n            erro_codigo = $2, erro_mensagem = $3,\n            agendado_para = CASE tentativas\n              WHEN 1 THEN now() + interval '5 minutes'\n              WHEN 2 THEN now() + interval '15 minutes'\n              WHEN 3 THEN now() + interval '1 hour'\n              WHEN 4 THEN now() + interval '4 hours'\n              ELSE now() + interval '12 hours'\n            END,\n            atualizado_em = now()\n          WHERE id = $1;`;\n}\n\nconst out = [];\nfor (let i = 0; i < items.length; i++) {\n  const resp = items[i].json;\n  const envio = claimed[i].json;\n  const statusCode = resp.statusCode;\n  const headers = resp.headers || {};\n  const body = resp.body || {};\n\n  let sql;\n  let params;\n  let sucesso = false;\n\n  if (statusCode >= 200 && statusCode < 300) {\n    sucesso = true;\n    const messageId = headers['x-message-id'] || null;\n    sql = 'UPDATE envios SET status=\\'enviado\\', provider_message_id=$2, enviado_em=now(), atualizado_em=now() WHERE id=$1;';\n    params = [envio.id, messageId];\n  } else {\n    const errros = (body && body.errors) || [];\n    const mensagem = errros.map((e) => e.message).join('; ') || `HTTP ${statusCode}`;\n    const pareceEmailInvalido = /does not contain a valid address|invalid.*email/i.test(mensagem);\n\n    if (statusCode === 400 && pareceEmailInvalido) {\n      sql = `WITH alvo AS (\n               UPDATE envios SET status='falha', erro_tipo='permanente', erro_codigo='400', erro_mensagem=$2, atualizado_em=now()\n               WHERE id=$1 RETURNING destino\n             )\n             INSERT INTO supressao (canal, destino, motivo)\n             SELECT 'email', destino, 'invalido' FROM alvo\n             ON CONFLICT (canal, destino) DO NOTHING;`;\n      params = [envio.id, mensagem.slice(0, 500)];\n    } else {\n      // Demais erros (401/403/429/5xx/desconhecido): temporário por padrão — mais seguro\n      // que suprimir um contato válido por causa de um problema do lado da conta/API.\n      sql = backoffSql();\n      params = [envio.id, String(statusCode), mensagem.slice(0, 500)];\n    }\n  }\n\n  out.push({ json: { sql, params, sucesso } });\n}\nreturn out;"
+      },
+      "id": "classificar03",
+      "name": "Classificar Resultado e Preparar Atualização",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.sql }}",
+        "options": {
+          "queryReplacement": "={{ $json.params }}"
+        }
+      },
+      "id": "aplicar03",
+      "name": "Aplicar Resultado",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1080,
+        -60
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const total = items.filter((it) => it.json.sucesso).length;\nreturn [{ json: { campanha_id: $('Avaliar Guardas').first().json.campanha_id, total } }];"
+      },
+      "id": "contar03",
+      "name": "Contar Sucessos",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE cota_diaria\nSET usado = usado + $2\nWHERE campanha_id = $1 AND canal = 'email'\n  AND dia = (now() AT TIME ZONE 'America/Sao_Paulo')::date;",
+        "options": {
+          "queryReplacement": "={{ [ $json.campanha_id, $json.total ] }}"
+        }
+      },
+      "id": "cota03",
+      "name": "Atualizar Cota Usada",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1300,
+        60
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "A Cada 10 Minutos (09-18h seg-sáb)": {
+      "main": [
+        [
+          {
+            "node": "Parâmetros",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parâmetros": {
+      "main": [
+        [
+          {
+            "node": "Checar Guardas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Checar Guardas": {
+      "main": [
+        [
+          {
+            "node": "Avaliar Guardas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Avaliar Guardas": {
+      "main": [
+        [
+          {
+            "node": "Claim Atômico do Lote",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Atômico do Lote": {
+      "main": [
+        [
+          {
+            "node": "Montar Corpo do E-mail (SendGrid)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Montar Corpo do E-mail (SendGrid)": {
+      "main": [
+        [
+          {
+            "node": "Enviar E-mail (SendGrid)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enviar E-mail (SendGrid)": {
+      "main": [
+        [
+          {
+            "node": "Classificar Resultado e Preparar Atualização",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classificar Resultado e Preparar Atualização": {
+      "main": [
+        [
+          {
+            "node": "Aplicar Resultado",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Contar Sucessos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Contar Sucessos": {
+      "main": [
+        [
+          {
+            "node": "Atualizar Cota Usada",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

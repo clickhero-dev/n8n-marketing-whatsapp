@@ -1,0 +1,240 @@
+{
+  "name": "06 - Monitor (Watchdog + Circuit Breaker + Reconciliação)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/10 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "trigger06",
+      "name": "A Cada 10 Minutos",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -700,
+        0
+      ],
+      "notes": "Sem restrição de janela — watchdog e circuit breaker rodam o tempo todo, diferente dos workflows de disparo."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "return [{ json: { campanha_id: 1 } }];"
+      },
+      "id": "params06",
+      "name": "Parâmetros",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -480,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE envios\nSET status = 'pendente', locked_at = NULL, atualizado_em = now()\nWHERE campanha_id = $1\n  AND status = 'enviando'\n  AND locked_at < now() - interval '15 minutes'\n  AND provider_message_id IS NULL\nRETURNING id;",
+        "options": {
+          "queryReplacement": "={{ [ $json.campanha_id ] }}"
+        }
+      },
+      "id": "watchdog06",
+      "name": "Watchdog: Liberar Travados",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -260,
+        -240
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      },
+      "notes": "provider_message_id IS NULL é essencial: se já tem message_id, a mensagem FOI enviada e é só o webhook que está atrasado — reprocessar geraria envio duplicado."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, canal, destino, enviado_em\nFROM envios\nWHERE campanha_id = $1 AND status = 'enviado' AND enviado_em < now() - interval '48 hours'\nORDER BY enviado_em;",
+        "options": {
+          "queryReplacement": "={{ [ $json.campanha_id ] }}"
+        }
+      },
+      "id": "perdidos06",
+      "name": "Detectar Webhook Perdido (48h)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -260,
+        -80
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      },
+      "notes": "Só sinaliza (visível no histórico de execução) — provável túnel fora do ar. Não corrige sozinho."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  count(*) FILTER (WHERE status='falha' AND erro_tipo='permanente')::float\n    / NULLIF(count(*) FILTER (WHERE status IN ('enviado','entregue','falha')), 0) AS taxa_bounce,\n  count(*) FILTER (WHERE status='falha' AND erro_codigo='reclamacao')::float\n    / NULLIF(count(*) FILTER (WHERE status IN ('enviado','entregue','falha')), 0) AS taxa_reclamacao\nFROM envios\nWHERE campanha_id = $1 AND canal='email' AND enviado_em > now() - interval '24 hours';",
+        "options": {
+          "queryReplacement": "={{ [ $json.campanha_id ] }}"
+        }
+      },
+      "id": "taxa06",
+      "name": "Calcular Taxa de Bounce e Reclamação",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -260,
+        80
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const r = items[0].json;\nconst taxaBounce = r.taxa_bounce != null ? parseFloat(r.taxa_bounce) : 0;\nconst taxaReclamacao = r.taxa_reclamacao != null ? parseFloat(r.taxa_reclamacao) : 0;\nconst disparar = taxaBounce > 0.05 || taxaReclamacao > 0.003;\nreturn [{\n  json: {\n    disparar, taxaBounce, taxaReclamacao,\n    campanha_id: $('Parâmetros').first().json.campanha_id,\n  },\n}];"
+      },
+      "id": "avaliar06",
+      "name": "Avaliar Circuit Breaker",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -40,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE campanhas SET pausada = true,\n  motivo_pausa = 'Circuit breaker: bounce=' || $2::text || ' reclamacao=' || $3::text || ' em ' || now()::text\nWHERE id = $1 AND $4::boolean = true AND pausada = false;",
+        "options": {
+          "queryReplacement": "={{ [ $json.campanha_id, $json.taxaBounce, $json.taxaReclamacao, $json.disparar ] }}"
+        }
+      },
+      "id": "pausar06",
+      "name": "Pausar por Circuit Breaker",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        180,
+        80
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      },
+      "notes": "Não retoma automaticamente — spec exige intervenção humana + higienização adicional (7.5)."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT canal, status, count(*),\n  round(100.0 * count(*) / sum(count(*)) OVER (PARTITION BY canal), 2) AS pct\nFROM envios\nWHERE campanha_id = $1\nGROUP BY canal, status\nORDER BY canal, status;",
+        "options": {
+          "queryReplacement": "={{ [ $json.campanha_id ] }}"
+        }
+      },
+      "id": "painel06",
+      "name": "Painel de Reconciliação",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -260,
+        240
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Postgres Campanha"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Parâmetros": {
+      "main": [
+        [
+          {
+            "node": "Watchdog: Liberar Travados",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Detectar Webhook Perdido (48h)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Calcular Taxa de Bounce e Reclamação",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Painel de Reconciliação",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A Cada 10 Minutos": {
+      "main": [
+        [
+          {
+            "node": "Parâmetros",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calcular Taxa de Bounce e Reclamação": {
+      "main": [
+        [
+          {
+            "node": "Avaliar Circuit Breaker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Avaliar Circuit Breaker": {
+      "main": [
+        [
+          {
+            "node": "Pausar por Circuit Breaker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

@@ -1,0 +1,36 @@
+services:
+  n8n:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    networks:
+      - default
+      - bni_network
+    environment:
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_WEBHOOK_URL: ${WEBHOOK_URL}
+      WEBHOOK_URL: ${WEBHOOK_URL}
+      GENERIC_TIMEZONE: America/Sao_Paulo
+      TZ: America/Sao_Paulo
+      NODE_FUNCTION_ALLOW_BUILTIN: crypto,dns
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      SENDGRID_API_KEY: ${SENDGRID_API_KEY}
+      SENDGRID_FROM: ${SENDGRID_FROM}
+      WA_PHONE_NUMBER_ID: ${WA_PHONE_NUMBER_ID}
+      WA_ACCESS_TOKEN: ${WA_ACCESS_TOKEN}
+      WA_TEMPLATE_NAME: ${WA_TEMPLATE_NAME}
+      WA_TEMPLATE_LANG: ${WA_TEMPLATE_LANG}
+      WA_VERIFY_TOKEN: ${WA_VERIFY_TOKEN}
+      WA_APP_SECRET: ${WA_APP_SECRET}
+      UNSUBSCRIBE_HMAC_SECRET: ${UNSUBSCRIBE_HMAC_SECRET}
+    volumes:
+      - n8ndata:/home/node/.n8n
+
+networks:
+  bni_network:
+    name: listagem-bni-robo_default
+    external: true
+
+volumes:
+  n8ndata:
